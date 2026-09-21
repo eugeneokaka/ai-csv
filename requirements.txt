@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+httpx
+pandas
+openpyxl
+matplotlib
+psycopg2-binary

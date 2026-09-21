@@ -1,30 +1,24 @@
 import helper
-import pandas as pd
 import matplotlib.pyplot as plt
 
 df = helper.get_first_csv()
 
-dept_salary = df.groupby('department')['salary'].sum().reset_index()
-dept_salary.columns = ['Department', 'Total Salary']
-
-print(dept_salary.to_string(index=False))
-
 fig, ax = plt.subplots(figsize=(8, 5))
-colors = ['#4CAF50', '#2196F3', '#FF9800']
-bars = ax.bar(dept_salary['Department'], dept_salary['Total Salary'], color=colors)
+ax.scatter(df["years_experience"], df["salary"], color="steelblue", s=100, edgecolors="black")
 
-for bar in bars:
-    ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 1000,
-            f'${bar.get_height():,.0f}', ha='center', va='bottom', fontweight='bold')
+ax.set_xlabel("Years of Experience")
+ax.set_ylabel("Salary")
+ax.set_title("Years of Experience vs Salary")
+ax.grid(True, linestyle="--", alpha=0.7)
 
-ax.set_title('Total Salaries by Department', fontsize=14, fontweight='bold')
-ax.set_xlabel('Department')
-ax.set_ylabel('Total Salary ($)')
-ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
+for i, row in df.iterrows():
+    ax.annotate(row["name"], (row["years_experience"], row["salary"]),
+                textcoords="offset points", xytext=(5, 5), fontsize=9)
+
 plt.tight_layout()
 
-helper.save_chart(fig, "total_salaries_by_department.png")
-helper.save_chart_to_excel(dept_salary, 'Department', 'Total Salary', 'salary_by_department.xlsx')
+print("Years of Experience vs Salary:")
+for _, row in df.iterrows():
+    print(f"  {row['name']}: {row['years_experience']} years -> {row['salary']:,.0f}")
 
-print("\nChart saved as total_salaries_by_department.png")
-print("Excel with chart saved as salary_by_department.xlsx")
+helper.save_chart(fig, "experience_vs_salary.png")

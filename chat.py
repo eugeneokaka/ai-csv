@@ -1,6 +1,7 @@
 """Chat: user question -> helper preview -> OpenCode -> execute code."""
 
 import base64
+import json
 import logging
 import os
 import shutil
@@ -10,10 +11,11 @@ import time
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from config import MODEL_ID, MODEL_PROVIDER, OPENCODE_URL
+from db import get_conn, init_db
 
 router = APIRouter()
 
@@ -60,8 +62,10 @@ You answer with ONLY the Python code — no markdown, no explanations.
 """
 
 
+# --- Pydantic models ---
+
 class AskRequest(BaseModel):
-    session_id: str
+    chat_id: str
     question: str
 
 
@@ -73,6 +77,145 @@ class AskResponse(BaseModel):
     attempts: int
     opencode_session_id: str | None = None
 
+
+class CreateChatRequest(BaseModel):
+    user_id: str
+    title: str | None = None
+
+
+class UpdateChatRequest(BaseModel):
+    title: str
+
+
+# --- DB helpers ---
+
+def _db_init():
+    init_db()
+
+
+def _chat_exists(chat_id: str) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM chat WHERE id = %s", (chat_id,))
+    exists = cur.fetchone() is not None
+    cur.close()
+    conn.close()
+    return exists
+
+
+def _get_opencode_session(chat_id: str) -> str | None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT opencode_session_id FROM chat WHERE id = %s", (chat_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row["opencode_session_id"] if row else None
+
+
+def _set_opencode_session(chat_id: str, oc_session_id: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE chat SET opencode_session_id = %s, updated_at = NOW() WHERE id = %s",
+        (oc_session_id, chat_id),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def _save_prompt(chat_id: str, question: str) -> str:
+    """Create a new prompt row when user sends a question. Returns the prompt ID."""
+    import uuid
+    prompt_id = str(uuid.uuid4())
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO prompt (id, chat_id, role, question)
+           VALUES (%s, %s, 'user', %s)""",
+        (prompt_id, chat_id, question),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    return prompt_id
+
+
+def _update_prompt(prompt_id: str, answer: str = None, code: str = None,
+                   files: list[dict] = None, duration_s: float = None,
+                   attempts: int = None):
+    """Update an existing prompt row with the agent's response."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """UPDATE prompt
+           SET answer = %s, code = %s, files = %s, duration_s = %s, attempts = %s
+           WHERE id = %s""",
+        (answer, code, json.dumps(files) if files else None, duration_s, attempts, prompt_id),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def _get_prompts(chat_id: str) -> list[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT question, answer, files, duration_s, created_at FROM prompt WHERE chat_id = %s ORDER BY created_at",
+        (chat_id,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+# --- OpenCode helpers ---
+
+async def opencode_chat(session_id: str, prompt: str) -> str:
+    """Send prompt to OpenCode and return the text response."""
+    logger.info("--- OPENCODE REQUEST ---")
+    logger.info("Session: %s | Prompt length: %d chars", session_id, len(prompt))
+    logger.debug("Prompt:\n%s", prompt[:2000])
+
+    async with httpx.AsyncClient(base_url=OPENCODE_URL, timeout=180) as client:
+        msg = await client.post(
+            f"/session/{session_id}/message",
+            json={
+                "model": {"providerID": MODEL_PROVIDER, "modelID": MODEL_ID},
+                "parts": [{"type": "text", "text": prompt}],
+            },
+        )
+        msg.raise_for_status()
+        data = msg.json()
+        parts = data.get("parts", [])
+        reply = "\n".join(p.get("text", "") for p in parts if p.get("type") == "text")
+
+        logger.info("--- OPENCODE RESPONSE ---")
+        logger.info("Reply length: %d chars", len(reply))
+        logger.debug("Reply:\n%s", reply[:2000])
+
+        return reply
+
+
+async def create_opencode_session() -> str | None:
+    """Create a new OpenCode session."""
+    logger.info("Creating OpenCode session...")
+    try:
+        async with httpx.AsyncClient(base_url=OPENCODE_URL, timeout=10) as client:
+            r = await client.post("/session", json={"title": "csv-analysis"})
+            r.raise_for_status()
+            session_id = r.json()["id"]
+            logger.info("OpenCode session created: %s", session_id)
+            return session_id
+    except Exception as e:
+        logger.error("Cannot reach OpenCode: %s", e)
+        return None
+
+
+# --- Prompt building ---
 
 def get_preview(filename: str) -> str:
     """Get first 5 rows + columns from a CSV."""
@@ -102,6 +245,8 @@ def build_prompt(question: str) -> str:
     print(f"Data preview:\n{data_desc}")
     return f"{SYSTEM_PROMPT}\n\nAvailable data:\n{data_desc}\n\nQuestion: {question}"
 
+
+# --- Code extraction and execution ---
 
 def extract_code(text: str) -> str:
     text = text.strip()
@@ -183,88 +328,41 @@ def run_code(code: str) -> dict:
     return {"stdout": stdout, "stderr": stderr, "files": files, "duration_s": duration, "returncode": rc}
 
 
-async def opencode_chat(session_id: str, prompt: str) -> str:
-    """Send prompt to OpenCode and return the text response."""
-    logger.info("--- OPENCODE REQUEST ---")
-    logger.info("Session: %s | Prompt length: %d chars", session_id, len(prompt))
-    logger.debug("Prompt:\n%s", prompt[:2000])
-
-    async with httpx.AsyncClient(base_url=OPENCODE_URL, timeout=180) as client:
-        msg = await client.post(
-            f"/session/{session_id}/message",
-            json={
-                "model": {"providerID": MODEL_PROVIDER, "modelID": MODEL_ID},
-                "parts": [{"type": "text", "text": prompt}],
-            },
-        )
-        msg.raise_for_status()
-        data = msg.json()
-        parts = data.get("parts", [])
-        reply = "\n".join(p.get("text", "") for p in parts if p.get("type") == "text")
-
-        logger.info("--- OPENCODE RESPONSE ---")
-        logger.info("Reply length: %d chars", len(reply))
-        logger.debug("Reply:\n%s", reply[:2000])
-
-        return reply
-
-
-async def get_or_create_session() -> str | None:
-    """Create a new OpenCode session."""
-    logger.info("Creating OpenCode session...")
-    try:
-        async with httpx.AsyncClient(base_url=OPENCODE_URL, timeout=10) as client:
-            r = await client.post("/session", json={"title": "csv-analysis"})
-            r.raise_for_status()
-            session_id = r.json()["id"]
-            logger.info("OpenCode session created: %s", session_id)
-            return session_id
-    except Exception as e:
-        logger.error("Cannot reach OpenCode: %s", e)
-        return None
-
-
-async def get_history(session_id: str) -> list[dict]:
-    """Get message history from OpenCode session."""
-    try:
-        async with httpx.AsyncClient(base_url=OPENCODE_URL, timeout=30) as client:
-            r = await client.get(f"/session/{session_id}/message")
-            r.raise_for_status()
-            out = []
-            for m in r.json() or []:
-                role = m.get("info", {}).get("role", "")
-                text = "\n".join(p.get("text", "") for p in m.get("parts", []) if p.get("type") == "text").strip()
-                if text:
-                    out.append({"role": role, "text": text})
-            return out
-    except Exception:
-        return []
-
+# --- API Endpoints ---
 
 @router.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest):
     logger.info("========================================")
     logger.info("NEW REQUEST")
-    logger.info("Session ID: %s", req.session_id)
+    logger.info("Chat ID: %s", req.chat_id)
     logger.info("Question: %s", req.question)
     logger.info("========================================")
 
-    session_id = await get_or_create_session()
-    if not session_id:
-        logger.error("OpenCode server not reachable")
-        return AskResponse(stdout="OpenCode server not running. Start it first.", stderr="", files=[], duration_s=0.0, attempts=1, opencode_session_id=None)
+    # Create user prompt row in DB
+    prompt_id = _save_prompt(req.chat_id, req.question)
+
+    # Get or create OpenCode session for this chat
+    oc_session = _get_opencode_session(req.chat_id)
+    if not oc_session:
+        oc_session = await create_opencode_session()
+        if not oc_session:
+            _update_prompt(prompt_id, answer="OpenCode server not running.", attempts=1)
+            return AskResponse(stdout="OpenCode server not running. Start it first.", stderr="", files=[], duration_s=0.0, attempts=1, opencode_session_id=None)
+        _set_opencode_session(req.chat_id, oc_session)
 
     prompt = build_prompt(req.question)
     try:
-        reply = await opencode_chat(session_id, prompt)
+        reply = await opencode_chat(oc_session, prompt)
     except Exception as e:
         logger.error("OpenCode call failed: %s", e)
-        return AskResponse(stdout="", stderr=str(e), files=[], duration_s=0.0, attempts=1, opencode_session_id=session_id)
+        _update_prompt(prompt_id, answer=str(e), attempts=1)
+        return AskResponse(stdout="", stderr=str(e), files=[], duration_s=0.0, attempts=1, opencode_session_id=oc_session)
 
     if "NO_CODE:" in reply:
         answer = reply.split("NO_CODE:", 1)[1].strip()
         logger.info("Conversational reply (no code): %s", answer)
-        return AskResponse(stdout=answer, stderr="", files=[], duration_s=0.0, attempts=1, opencode_session_id=session_id)
+        _update_prompt(prompt_id, answer=answer, attempts=1)
+        return AskResponse(stdout=answer, stderr="", files=[], duration_s=0.0, attempts=1, opencode_session_id=oc_session)
 
     code = extract_code(reply)
     if not code:
@@ -274,13 +372,14 @@ async def ask(req: AskRequest):
             logger.warning("No code extracted but reply mentions output — re-prompting for code")
             fix_prompt = "You mentioned saving output but did not provide Python code. Return ONLY the Python code that generates and saves the output. No explanations."
             try:
-                fix_reply = await opencode_chat(session_id, fix_prompt)
+                fix_reply = await opencode_chat(oc_session, fix_prompt)
                 code = extract_code(fix_reply)
             except Exception:
                 pass
         if not code:
             logger.warning("No code extracted from reply")
-            return AskResponse(stdout=reply.strip(), stderr="", files=[], duration_s=0.0, attempts=1, opencode_session_id=session_id)
+            _update_prompt(prompt_id, answer=reply.strip(), attempts=1)
+            return AskResponse(stdout=reply.strip(), stderr="", files=[], duration_s=0.0, attempts=1, opencode_session_id=oc_session)
 
     logger.info("Extracted %d chars of code", len(code))
     result = run_code(code)
@@ -291,7 +390,7 @@ async def ask(req: AskRequest):
         logger.info("--- AUTO-FIX attempt %d ---", attempts)
         fix_prompt = f"Your code errored:\n{result['stderr'][-3000:]}\nFix it. Return ONLY the corrected code."
         try:
-            fix_reply = await opencode_chat(session_id, fix_prompt)
+            fix_reply = await opencode_chat(oc_session, fix_prompt)
         except Exception as e:
             logger.error("Fix call failed: %s", e)
             break
@@ -304,14 +403,112 @@ async def ask(req: AskRequest):
     logger.info("DONE | attempts=%d | stdout=%d bytes | stderr=%d bytes | files=%d",
                 attempts, len(result["stdout"]), len(result["stderr"]), len(result["files"]))
 
+    # Update prompt row with agent response
+    _update_prompt(
+        prompt_id,
+        answer=result["stdout"] or result["stderr"],
+        code=code,
+        files=result["files"],
+        duration_s=result["duration_s"],
+        attempts=attempts,
+    )
+
     return AskResponse(
         stdout=result["stdout"],
         stderr=result["stderr"],
         files=result["files"],
         duration_s=result["duration_s"],
         attempts=attempts,
-        opencode_session_id=session_id,
+        opencode_session_id=oc_session,
     )
+
+
+# --- Chat CRUD endpoints ---
+
+@router.get("/sessions")
+def list_sessions(user_id: str):
+    """List all chats for a user."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, title, created_at, updated_at FROM chat WHERE user_id = %s ORDER BY updated_at DESC",
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    # Convert datetime to string for JSON
+    for r in rows:
+        for k in ("created_at", "updated_at"):
+            if r[k]:
+                r[k] = r[k].isoformat()
+    return {"sessions": rows}
+
+
+@router.post("/sessions")
+def create_session(req: CreateChatRequest):
+    """Create a new chat."""
+    import uuid
+    chat_id = str(uuid.uuid4())
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO chat (id, user_id, title) VALUES (%s, %s, %s)",
+        (chat_id, req.user_id, req.title or "New Chat"),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"id": chat_id, "title": req.title or "New Chat"}
+
+
+@router.put("/sessions/{chat_id}")
+def update_session(chat_id: str, req: UpdateChatRequest):
+    """Update chat title."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE chat SET title = %s, updated_at = NOW() WHERE id = %s",
+        (req.title, chat_id),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"ok": True}
+
+
+@router.delete("/sessions/{chat_id}")
+def delete_session(chat_id: str):
+    """Delete a chat and all its prompts."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM chat WHERE id = %s", (chat_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"ok": True}
+
+
+@router.get("/history")
+def history(chat_id: str):
+    """Get chat history from DB — 1 row per Q&A."""
+    prompts = _get_prompts(chat_id)
+    messages = []
+    for p in prompts:
+        # User message (always present)
+        if p["question"]:
+            messages.append({"role": "user", "text": p["question"]})
+        # Assistant message (present after agent answers)
+        if p["answer"]:
+            files = p["files"] or []
+            messages.append({
+                "role": "assistant",
+                "text": p["answer"],
+                "files": files,
+                "duration_s": p["duration_s"],
+            })
+    logger.info("Returning %d messages for chat %s", len(messages), chat_id)
+    return {"messages": messages}
 
 
 @router.get("/outputs")
@@ -339,14 +536,3 @@ def list_outputs():
                 "content_base64": base64.b64encode(data).decode(),
             })
     return {"files": files}
-
-
-@router.get("/history")
-async def history(session_id: str):
-    logger.info("History request for session: %s", session_id)
-    oc_session = await get_or_create_session()
-    if not oc_session:
-        return {"messages": []}
-    msgs = await get_history(oc_session)
-    logger.info("Returning %d messages", len(msgs))
-    return {"messages": msgs}
