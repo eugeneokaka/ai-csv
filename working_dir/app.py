@@ -1,24 +1,19 @@
 import helper
-import matplotlib.pyplot as plt
+from openpyxl.styles import PatternFill
 
-df = helper.get_first_csv()
+df = helper.get_full_csv("data_without_city.csv")
 
-fig, ax = plt.subplots(figsize=(8, 5))
-ax.scatter(df["years_experience"], df["salary"], color="steelblue", s=100, edgecolors="black")
+helper.save_excel(df, "salary_green.xlsx")
 
-ax.set_xlabel("Years of Experience")
-ax.set_ylabel("Salary")
-ax.set_title("Years of Experience vs Salary")
-ax.grid(True, linestyle="--", alpha=0.7)
+wb = helper.load_workbook("salary_green.xlsx")
+ws = wb.active
 
-for i, row in df.iterrows():
-    ax.annotate(row["name"], (row["years_experience"], row["salary"]),
-                textcoords="offset points", xytext=(5, 5), fontsize=9)
+green_fill = PatternFill(start_color="92D050", end_color="92D050", fill_type="solid")
 
-plt.tight_layout()
+for row in range(2, ws.max_row + 1):
+    ws.cell(row=row, column=6).fill = green_fill
 
-print("Years of Experience vs Salary:")
-for _, row in df.iterrows():
-    print(f"  {row['name']}: {row['years_experience']} years -> {row['salary']:,.0f}")
+wb.save(helper.get_output_path("salary_green.xlsx"))
 
-helper.save_chart(fig, "experience_vs_salary.png")
+print("Salary column highlighted in green!")
+print(df.to_string(index=False))

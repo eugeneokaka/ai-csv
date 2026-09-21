@@ -67,6 +67,7 @@ You answer with ONLY the Python code — no markdown, no explanations.
 class AskRequest(BaseModel):
     chat_id: str
     question: str
+    selected_file: str | None = None
 
 
 class AskResponse(BaseModel):
@@ -218,20 +219,41 @@ async def create_opencode_session() -> str | None:
 # --- Prompt building ---
 
 def get_preview(filename: str) -> str:
-    """Get first 5 rows + columns from a CSV."""
+    """Get first 5 rows + columns from a CSV. Checks output first, then uploads."""
     import pandas as pd
-    df = pd.read_csv(UPLOADS / filename)
+    path = OUTPUT / filename if (OUTPUT / filename).exists() else UPLOADS / filename
+    df = pd.read_csv(path)
     cols = list(df.columns)
     preview = df.head(5).to_string(index=False)
     return f"Columns: {cols}\n5 rows:\n{preview}"
 
 
 def list_session_files() -> list[str]:
-    return [f.name for f in sorted(UPLOADS.iterdir()) if f.suffix == ".csv"]
+    """List CSV files from output (latest first) and uploads."""
+    files = []
+    for f in sorted(OUTPUT.glob("*.csv"), key=os.path.getmtime, reverse=True):
+        files.append(f.name)
+    for f in sorted(UPLOADS.glob("*.csv")):
+        if f.name not in files:
+            files.append(f.name)
+    return files
 
 
-def build_prompt(question: str) -> str:
+def list_all_files() -> list[dict]:
+    """List all files from both uploads/ and output/."""
+    files = []
+    for f in sorted(UPLOADS.iterdir()):
+        if f.is_file() and f.suffix in (".csv", ".xlsx", ".png", ".json"):
+            files.append({"name": f.name, "source": "uploads"})
+    for f in sorted(OUTPUT.iterdir(), key=os.path.getmtime, reverse=True):
+        if f.is_file() and f.suffix in (".csv", ".xlsx", ".png", ".json"):
+            files.append({"name": f.name, "source": "output"})
+    return files
+
+
+def build_prompt(question: str, selected_file: str = None) -> str:
     files = list_session_files()
+    all_files = list_all_files()
     if not files:
         data_desc = "No files uploaded yet."
     else:
@@ -239,11 +261,21 @@ def build_prompt(question: str) -> str:
         for f in files:
             previews.append(f"--- {f} ---\n{get_preview(f)}")
         data_desc = "\n\n".join(previews)
+
+    # List all available files
+    file_list = "\n".join([f"  - {f['name']} ({f['source']})" for f in all_files]) if all_files else "  (none)"
+
+    # If user selected a specific file, include it
+    selected_hint = ""
+    if selected_file:
+        selected_hint = f"\n\nUser selected file: {selected_file} — work with this file. Use helper.get_full_csv(\"{selected_file}\") to load it."
+
     print("=== PROMPT ===")
     print(f"Question: {question}")
     print(f"Available files: {files}")
+    print(f"Selected file: {selected_file}")
     print(f"Data preview:\n{data_desc}")
-    return f"{SYSTEM_PROMPT}\n\nAvailable data:\n{data_desc}\n\nQuestion: {question}"
+    return f"{SYSTEM_PROMPT}\n\nAvailable files:\n{file_list}\n\nData preview:\n{data_desc}{selected_hint}\n\nQuestion: {question}"
 
 
 # --- Code extraction and execution ---
@@ -350,7 +382,7 @@ async def ask(req: AskRequest):
             return AskResponse(stdout="OpenCode server not running. Start it first.", stderr="", files=[], duration_s=0.0, attempts=1, opencode_session_id=None)
         _set_opencode_session(req.chat_id, oc_session)
 
-    prompt = build_prompt(req.question)
+    prompt = build_prompt(req.question, req.selected_file)
     try:
         reply = await opencode_chat(oc_session, prompt)
     except Exception as e:
@@ -509,6 +541,23 @@ def history(chat_id: str):
             })
     logger.info("Returning %d messages for chat %s", len(messages), chat_id)
     return {"messages": messages}
+
+
+@router.get("/files")
+def list_all_files_endpoint():
+    """List all files from both uploads/ and output/."""
+    return {"files": list_all_files()}
+
+
+@router.get("/download/{filename}")
+def download_file(filename: str):
+    """Download a file from output/ or uploads/."""
+    from fastapi.responses import FileResponse
+    # Check output first, then uploads
+    path = OUTPUT / filename if (OUTPUT / filename).exists() else UPLOADS / filename
+    if not path.exists():
+        raise HTTPException(404, "File not found")
+    return FileResponse(path, filename=filename)
 
 
 @router.get("/outputs")

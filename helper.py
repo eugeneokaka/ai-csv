@@ -1,5 +1,6 @@
 """Functions available to AI-generated code running in working_dir/app.py."""
 
+import os
 from pathlib import Path
 
 WORKDIR = Path(__file__).resolve().parent / "working_dir"
@@ -20,9 +21,25 @@ def _plt():
     return plt
 
 
+def _unique_name(directory: Path, filename: str) -> str:
+    """Auto-rename if file exists: file.csv -> file_1.csv -> file_2.csv"""
+    path = directory / filename
+    if not path.exists():
+        return filename
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    counter = 1
+    while path.exists():
+        path = directory / f"{stem}_{counter}{suffix}"
+        counter += 1
+    return path.name
+
+
 def get_preview(filename: str, rows: int = 5) -> str:
     pd = _pd()
-    df = pd.read_csv(UPLOADS / filename)
+    # Check output first, then uploads
+    path = OUTPUT / filename if (OUTPUT / filename).exists() else UPLOADS / filename
+    df = pd.read_csv(path)
     cols = list(df.columns)
     preview = df.head(rows).to_string(index=False)
     return f"Columns: {cols}\n{rows} rows (showing first {min(rows, len(df))}):\n{preview}"
@@ -30,26 +47,45 @@ def get_preview(filename: str, rows: int = 5) -> str:
 
 def get_full_csv(filename: str):
     pd = _pd()
-    return pd.read_csv(UPLOADS / filename)
+    # Check output first, then uploads
+    path = OUTPUT / filename if (OUTPUT / filename).exists() else UPLOADS / filename
+    return pd.read_csv(path)
 
 
 def get_first_csv():
     pd = _pd()
-    csvs = sorted(UPLOADS.glob("*.csv"))
-    if not csvs:
+    # Check output first (latest by modification time)
+    output_csvs = sorted(OUTPUT.glob("*.csv"), key=os.path.getmtime, reverse=True)
+    if output_csvs:
+        return pd.read_csv(output_csvs[0])
+    # Fall back to uploads
+    upload_csvs = sorted(UPLOADS.glob("*.csv"))
+    if not upload_csvs:
         raise FileNotFoundError("No CSV files uploaded yet.")
-    return pd.read_csv(csvs[0])
+    return pd.read_csv(upload_csvs[0])
 
 
 def first_csv_name() -> str:
-    csvs = sorted(UPLOADS.glob("*.csv"))
-    if not csvs:
+    # Check output first
+    output_csvs = sorted(OUTPUT.glob("*.csv"), key=os.path.getmtime, reverse=True)
+    if output_csvs:
+        return output_csvs[0].name
+    upload_csvs = sorted(UPLOADS.glob("*.csv"))
+    if not upload_csvs:
         raise FileNotFoundError("No CSV files uploaded yet.")
-    return csvs[0].name
+    return upload_csvs[0].name
 
 
-def list_files() -> list[str]:
-    return [f.name for f in sorted(UPLOADS.iterdir()) if f.suffix == ".csv"]
+def list_files() -> list[dict]:
+    """List all files from both uploads/ and output/ with source info."""
+    files = []
+    for f in sorted(UPLOADS.iterdir()):
+        if f.is_file() and f.suffix in (".csv", ".xlsx", ".png", ".json"):
+            files.append({"name": f.name, "source": "uploads"})
+    for f in sorted(OUTPUT.iterdir(), key=os.path.getmtime, reverse=True):
+        if f.is_file() and f.suffix in (".csv", ".xlsx", ".png", ".json"):
+            files.append({"name": f.name, "source": "output"})
+    return files
 
 
 def get_output_path(filename: str) -> str:
@@ -63,27 +99,32 @@ def get_output_dir() -> str:
 def save_csv(df, filename: str = "output.csv", index: bool = False) -> str:
     if not filename.endswith(".csv"):
         filename += ".csv"
-    df.to_csv(OUTPUT / filename, index=index)
-    return filename
+    final_name = _unique_name(OUTPUT, filename)
+    df.to_csv(OUTPUT / final_name, index=index)
+    return final_name
 
 
 def save_chart(fig, filename: str = "chart.png") -> str:
     if not filename.endswith(".png"):
         filename += ".png"
-    fig.savefig(OUTPUT / filename, format="png", dpi=150, bbox_inches="tight")
-    return filename
+    final_name = _unique_name(OUTPUT, filename)
+    fig.savefig(OUTPUT / final_name, format="png", dpi=150, bbox_inches="tight")
+    return final_name
 
 
 def save_excel(df, filename: str = "output.xlsx", index: bool = False) -> str:
     if not filename.endswith(".xlsx"):
         filename += ".xlsx"
-    df.to_excel(OUTPUT / filename, index=index)
-    return filename
+    final_name = _unique_name(OUTPUT, filename)
+    df.to_excel(OUTPUT / final_name, index=index)
+    return final_name
 
 
 def load_workbook(filename: str):
     from openpyxl import load_workbook as _load
-    return _load(OUTPUT / filename)
+    # Check output first, then uploads
+    path = OUTPUT / filename if (OUTPUT / filename).exists() else UPLOADS / filename
+    return _load(path)
 
 
 def delete_output(filename: str) -> bool:
@@ -101,6 +142,8 @@ def save_chart_to_excel(df, x_column: str, y_column: str, filename: str = "chart
 
     if not filename.endswith(".xlsx"):
         filename += ".xlsx"
+
+    final_name = _unique_name(OUTPUT, filename)
 
     wb = Workbook()
     ws = wb.active
@@ -144,8 +187,8 @@ def save_chart_to_excel(df, x_column: str, y_column: str, filename: str = "chart
     chart_ws = wb.create_sheet("Chart")
     chart_ws.add_chart(chart, "A1")
 
-    wb.save(OUTPUT / filename)
-    return filename
+    wb.save(OUTPUT / final_name)
+    return final_name
 
 
 def sum_column(df, column: str) -> float:
