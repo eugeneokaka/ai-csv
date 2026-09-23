@@ -11,9 +11,10 @@ import time
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from auth import current_user_id, require_chat_owner
 from config import MODEL_ID, MODEL_PROVIDER, OPENCODE_URL
 from db import get_conn, init_db
 
@@ -30,17 +31,34 @@ MAX_FIX_RETRIES = 3
 CODE_TIMEOUT = 60
 
 WORKDIR = Path(__file__).parent / "working_dir"
-UPLOADS = WORKDIR / "uploads"
-OUTPUT = WORKDIR / "output"
-APP_FILE = WORKDIR / "app.py"
+UPLOADS_ROOT = WORKDIR / "uploads"
+OUTPUT_ROOT = WORKDIR / "output"
+
+
+def _uploads_dir(chat_id: str) -> Path:
+    d = UPLOADS_ROOT / chat_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _output_dir(chat_id: str) -> Path:
+    d = OUTPUT_ROOT / chat_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _run_dir(chat_id: str) -> Path:
+    d = WORKDIR / chat_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
 
 SYSTEM_PROMPT = """You are an AI data analyst. Generate Python code to analyze CSV data.
 
 STRICT RULES:
-- ONLY touch files in working_dir/ (uploads/ for reading, output/ for writing)
-- Your cwd IS working_dir — so output/ means working_dir/output. NEVER write to api/output.
-- Use `import helper` for ALL file I/O — no exceptions
-- To load data use: df = helper.get_first_csv() — this loads the first uploaded CSV
+- Use `import helper` for ALL file I/O — no exceptions. Never build file paths yourself.
+- Your working directory is private to this chat. helper already points at the right folders.
+- To load data use: df = helper.get_first_csv() — this loads the latest CSV for this chat
 - To save edited CSVs: helper.save_csv(df, "name.csv")
 - To save charts as images: helper.save_chart(fig, "name.png")
 - To save Excel with data: helper.save_excel(df, "name.xlsx")
@@ -48,12 +66,12 @@ STRICT RULES:
 - To get full output path: helper.get_output_path("file.xlsx") or helper.get_output_dir()
 - To openpyxl style Excel: helper.save_excel(df, "out.xlsx") then wb = helper.load_workbook("out.xlsx") then style wb then wb.save(helper.get_output_path("out.xlsx"))
 - NEVER create temp files — save once, load with helper.load_workbook(), style, save again
-- NEVER use os, sys, subprocess, open() on files outside working_dir/
+- NEVER use os, sys, subprocess, open() on files — use helper functions only
 - NEVER use df.to_csv(), df.to_excel(), plt.savefig(), open() for output files — use helper functions only
 - NEVER hardcode absolute paths — use helper.get_output_path() or helper.get_output_dir()
 - NEVER use matplotlib to embed charts in Excel — use helper.save_chart_to_excel() instead
 - ALWAYS print results to stdout in human-readable format
-- ALWAYS save any edited data or charts to output/ via helper — do NOT just print, also save
+- ALWAYS save any edited data or charts to output via helper — do NOT just print, also save
 - Keep answers short and friendly — this goes to a non-technical user
 - Format numbers nicely (round, commas, %)
 - If the question is NOT about data (greeting, meta), output exactly: NO_CODE: <your answer>
@@ -80,7 +98,6 @@ class AskResponse(BaseModel):
 
 
 class CreateChatRequest(BaseModel):
-    user_id: str
     title: str | None = None
 
 
@@ -218,59 +235,59 @@ async def create_opencode_session() -> str | None:
 
 # --- Prompt building ---
 
-def get_preview(filename: str) -> str:
+def get_preview(chat_id: str, filename: str) -> str:
     """Get first 5 rows + columns from a CSV. Checks output first, then uploads."""
     import pandas as pd
-    path = OUTPUT / filename if (OUTPUT / filename).exists() else UPLOADS / filename
+    out = _output_dir(chat_id) / filename
+    path = out if out.exists() else _uploads_dir(chat_id) / filename
     df = pd.read_csv(path)
     cols = list(df.columns)
     preview = df.head(5).to_string(index=False)
     return f"Columns: {cols}\n5 rows:\n{preview}"
 
 
-def list_session_files() -> list[str]:
-    """List CSV files from output (latest first) and uploads."""
+def list_session_files(chat_id: str) -> list[str]:
+    """List CSV files from output (latest first) and uploads for this chat."""
     files = []
-    for f in sorted(OUTPUT.glob("*.csv"), key=os.path.getmtime, reverse=True):
+    for f in sorted(_output_dir(chat_id).glob("*.csv"), key=os.path.getmtime, reverse=True):
         files.append(f.name)
-    for f in sorted(UPLOADS.glob("*.csv")):
+    for f in sorted(_uploads_dir(chat_id).glob("*.csv")):
         if f.name not in files:
             files.append(f.name)
     return files
 
 
-def list_all_files() -> list[dict]:
-    """List all files from both uploads/ and output/."""
+def list_all_files(chat_id: str) -> list[dict]:
+    """List all files from both this chat's uploads/ and output/."""
     files = []
-    for f in sorted(UPLOADS.iterdir()):
+    for f in sorted(_uploads_dir(chat_id).iterdir()):
         if f.is_file() and f.suffix in (".csv", ".xlsx", ".png", ".json"):
             files.append({"name": f.name, "source": "uploads"})
-    for f in sorted(OUTPUT.iterdir(), key=os.path.getmtime, reverse=True):
+    for f in sorted(_output_dir(chat_id).iterdir(), key=os.path.getmtime, reverse=True):
         if f.is_file() and f.suffix in (".csv", ".xlsx", ".png", ".json"):
             files.append({"name": f.name, "source": "output"})
     return files
 
 
-def build_prompt(question: str, selected_file: str = None) -> str:
-    files = list_session_files()
-    all_files = list_all_files()
+def build_prompt(chat_id: str, question: str, selected_file: str = None) -> str:
+    files = list_session_files(chat_id)
+    all_files = list_all_files(chat_id)
     if not files:
         data_desc = "No files uploaded yet."
     else:
         previews = []
         for f in files:
-            previews.append(f"--- {f} ---\n{get_preview(f)}")
+            previews.append(f"--- {f} ---\n{get_preview(chat_id, f)}")
         data_desc = "\n\n".join(previews)
 
-    # List all available files
     file_list = "\n".join([f"  - {f['name']} ({f['source']})" for f in all_files]) if all_files else "  (none)"
 
-    # If user selected a specific file, include it
     selected_hint = ""
     if selected_file:
         selected_hint = f"\n\nUser selected file: {selected_file} — work with this file. Use helper.get_full_csv(\"{selected_file}\") to load it."
 
     print("=== PROMPT ===")
+    print(f"Chat: {chat_id}")
     print(f"Question: {question}")
     print(f"Available files: {files}")
     print(f"Selected file: {selected_file}")
@@ -297,23 +314,32 @@ def extract_code(text: str) -> str:
     return "\n".join(code_lines).strip()
 
 
-def run_code(code: str) -> dict:
-    logger.info("--- EXECUTING CODE ---")
+def run_code(chat_id: str, code: str) -> dict:
+    logger.info("--- EXECUTING CODE (chat=%s) ---", chat_id)
     logger.debug("Code:\n%s", code)
 
-    APP_FILE.write_text(code, encoding="utf-8")
-    OUTPUT.mkdir(exist_ok=True)
+    run_dir = _run_dir(chat_id)
+    output_dir = _output_dir(chat_id)
+    app_file = run_dir / "app.py"
+    app_file.write_text(code, encoding="utf-8")
+
+    # Snapshot existing files so we only return NEW ones after execution
+    existing_files = set(f.name for f in output_dir.iterdir() if f.is_file())
 
     start = time.monotonic()
     try:
-        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-        # Add api/ directory to PYTHONPATH so `import helper` works from working_dir/
+        env = {
+            **os.environ,
+            "PYTHONIOENCODING": "utf-8",
+            "CHAT_ID": chat_id,
+        }
+        # Add api/ directory to PYTHONPATH so `import helper` works from the run dir
         api_dir = str(Path(__file__).parent)
         env["PYTHONPATH"] = api_dir + os.pathsep + env.get("PYTHONPATH", "")
 
         proc = subprocess.run(
             [sys.executable, "app.py"],
-            cwd=str(WORKDIR),
+            cwd=str(run_dir),
             capture_output=True,
             text=True,
             timeout=CODE_TIMEOUT,
@@ -333,18 +359,18 @@ def run_code(code: str) -> dict:
     if stderr.strip():
         logger.warning("STDERR:\n%s", stderr.strip())
 
-    # Auto-heal: move stray output files that landed outside working_dir/output
-    stray_dir = Path(__file__).parent / "output"
+    # Auto-heal: move stray files written to a relative output/ dir into the chat's output dir
+    stray_dir = run_dir / "output"
     if stray_dir.exists() and stray_dir.is_dir():
         for f in stray_dir.iterdir():
             if f.is_file():
-                dest = OUTPUT / f.name
+                dest = output_dir / f.name
                 shutil.move(str(f), str(dest))
                 logger.warning("Moved stray output file: %s -> %s", f.name, dest)
 
     files = []
-    for f in sorted(OUTPUT.iterdir()):
-        if f.is_file():
+    for f in sorted(output_dir.iterdir()):
+        if f.is_file() and f.name not in existing_files:
             data = f.read_bytes()
             files.append({
                 "name": f.name,
@@ -363,7 +389,8 @@ def run_code(code: str) -> dict:
 # --- API Endpoints ---
 
 @router.post("/ask", response_model=AskResponse)
-async def ask(req: AskRequest):
+async def ask(req: AskRequest, user_id: str = Depends(current_user_id)):
+    require_chat_owner(req.chat_id, user_id)
     logger.info("========================================")
     logger.info("NEW REQUEST")
     logger.info("Chat ID: %s", req.chat_id)
@@ -382,7 +409,7 @@ async def ask(req: AskRequest):
             return AskResponse(stdout="OpenCode server not running. Start it first.", stderr="", files=[], duration_s=0.0, attempts=1, opencode_session_id=None)
         _set_opencode_session(req.chat_id, oc_session)
 
-    prompt = build_prompt(req.question, req.selected_file)
+    prompt = build_prompt(req.chat_id, req.question, req.selected_file)
     try:
         reply = await opencode_chat(oc_session, prompt)
     except Exception as e:
@@ -414,7 +441,7 @@ async def ask(req: AskRequest):
             return AskResponse(stdout=reply.strip(), stderr="", files=[], duration_s=0.0, attempts=1, opencode_session_id=oc_session)
 
     logger.info("Extracted %d chars of code", len(code))
-    result = run_code(code)
+    result = run_code(req.chat_id, code)
     attempts = 1
 
     while result["stderr"].strip() and attempts < MAX_FIX_RETRIES:
@@ -430,7 +457,7 @@ async def ask(req: AskRequest):
         if not code:
             logger.warning("No code in fix reply")
             break
-        result = run_code(code)
+        result = run_code(req.chat_id, code)
 
     logger.info("DONE | attempts=%d | stdout=%d bytes | stderr=%d bytes | files=%d",
                 attempts, len(result["stdout"]), len(result["stderr"]), len(result["files"]))
@@ -458,8 +485,8 @@ async def ask(req: AskRequest):
 # --- Chat CRUD endpoints ---
 
 @router.get("/sessions")
-def list_sessions(user_id: str):
-    """List all chats for a user."""
+def list_sessions(user_id: str = Depends(current_user_id)):
+    """List all chats for the authenticated user."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -469,7 +496,6 @@ def list_sessions(user_id: str):
     rows = cur.fetchall()
     cur.close()
     conn.close()
-    # Convert datetime to string for JSON
     for r in rows:
         for k in ("created_at", "updated_at"):
             if r[k]:
@@ -478,25 +504,27 @@ def list_sessions(user_id: str):
 
 
 @router.post("/sessions")
-def create_session(req: CreateChatRequest):
-    """Create a new chat."""
+def create_session(req: CreateChatRequest, user_id: str = Depends(current_user_id)):
+    """Create a new chat owned by the authenticated user."""
     import uuid
     chat_id = str(uuid.uuid4())
+    title = req.title or "New Chat"
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO chat (id, user_id, title) VALUES (%s, %s, %s)",
-        (chat_id, req.user_id, req.title or "New Chat"),
+        (chat_id, user_id, title),
     )
     conn.commit()
     cur.close()
     conn.close()
-    return {"id": chat_id, "title": req.title or "New Chat"}
+    return {"id": chat_id, "title": title}
 
 
 @router.put("/sessions/{chat_id}")
-def update_session(chat_id: str, req: UpdateChatRequest):
-    """Update chat title."""
+def update_session(chat_id: str, req: UpdateChatRequest, user_id: str = Depends(current_user_id)):
+    """Update chat title (owner only)."""
+    require_chat_owner(chat_id, user_id)
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -510,8 +538,9 @@ def update_session(chat_id: str, req: UpdateChatRequest):
 
 
 @router.delete("/sessions/{chat_id}")
-def delete_session(chat_id: str):
-    """Delete a chat and all its prompts."""
+def delete_session(chat_id: str, user_id: str = Depends(current_user_id)):
+    """Delete a chat and all its prompts (owner only)."""
+    require_chat_owner(chat_id, user_id)
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM chat WHERE id = %s", (chat_id,))
@@ -522,15 +551,14 @@ def delete_session(chat_id: str):
 
 
 @router.get("/history")
-def history(chat_id: str):
-    """Get chat history from DB — 1 row per Q&A."""
+def history(chat_id: str, user_id: str = Depends(current_user_id)):
+    """Get chat history from DB — 1 row per Q&A (owner only)."""
+    require_chat_owner(chat_id, user_id)
     prompts = _get_prompts(chat_id)
     messages = []
     for p in prompts:
-        # User message (always present)
         if p["question"]:
             messages.append({"role": "user", "text": p["question"]})
-        # Assistant message (present after agent answers)
         if p["answer"]:
             files = p["files"] or []
             messages.append({
@@ -544,39 +572,32 @@ def history(chat_id: str):
 
 
 @router.get("/files")
-def list_all_files_endpoint():
-    """List all files from both uploads/ and output/."""
-    return {"files": list_all_files()}
+def list_all_files_endpoint(chat_id: str, user_id: str = Depends(current_user_id)):
+    """List all files from this chat's uploads/ and output/ (owner only)."""
+    require_chat_owner(chat_id, user_id)
+    return {"files": list_all_files(chat_id)}
 
 
 @router.get("/download/{filename}")
-def download_file(filename: str):
-    """Download a file from output/ or uploads/."""
+def download_file(filename: str, chat_id: str, user_id: str = Depends(current_user_id)):
+    """Download a file from this chat's output/ or uploads/ (owner only)."""
     from fastapi.responses import FileResponse
-    # Check output first, then uploads
-    path = OUTPUT / filename if (OUTPUT / filename).exists() else UPLOADS / filename
+    require_chat_owner(chat_id, user_id)
+    name = Path(filename).name
+    out = _output_dir(chat_id) / name
+    path = out if out.exists() else _uploads_dir(chat_id) / name
     if not path.exists():
         raise HTTPException(404, "File not found")
-    return FileResponse(path, filename=filename)
+    return FileResponse(path, filename=name)
 
 
 @router.get("/outputs")
-def list_outputs():
-    """List all files in the output folder."""
-    # Auto-heal: move stray output files before listing
-    stray_dir = Path(__file__).parent / "output"
-    if stray_dir.exists() and stray_dir.is_dir():
-        OUTPUT.mkdir(exist_ok=True)
-        for f in stray_dir.iterdir():
-            if f.is_file():
-                dest = OUTPUT / f.name
-                shutil.move(str(f), str(dest))
-                logger.warning("Moved stray output file: %s -> %s", f.name, dest)
-
-    if not OUTPUT.exists():
-        return {"files": []}
+def list_outputs(chat_id: str, user_id: str = Depends(current_user_id)):
+    """List all files in this chat's output folder (owner only)."""
+    require_chat_owner(chat_id, user_id)
+    output_dir = _output_dir(chat_id)
     files = []
-    for f in sorted(OUTPUT.iterdir()):
+    for f in sorted(output_dir.iterdir()):
         if f.is_file():
             data = f.read_bytes()
             files.append({

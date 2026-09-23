@@ -4,9 +4,14 @@ import os
 from pathlib import Path
 
 WORKDIR = Path(__file__).resolve().parent / "working_dir"
-UPLOADS = WORKDIR / "uploads"
-OUTPUT = WORKDIR / "output"
-OUTPUT.mkdir(exist_ok=True)
+
+# chat.run_code() injects CHAT_ID into the subprocess env. It scopes all
+# reads/writes to this chat's own folders so chats never see each other.
+CHAT_ID = os.environ.get("CHAT_ID", "")
+UPLOADS = WORKDIR / "uploads" / CHAT_ID
+OUTPUT = WORKDIR / "output" / CHAT_ID
+UPLOADS.mkdir(parents=True, exist_ok=True)
+OUTPUT.mkdir(parents=True, exist_ok=True)
 
 
 def _pd():

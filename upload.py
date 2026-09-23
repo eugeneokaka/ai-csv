@@ -1,13 +1,22 @@
 from pathlib import Path
 
 import pandas as pd
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
+
+from auth import current_user_id, require_chat_owner
 
 router = APIRouter()
 
-UPLOAD_DIR = Path(__file__).parent / "working_dir" / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
+WORKDIR = Path(__file__).parent / "working_dir"
+UPLOADS_ROOT = WORKDIR / "uploads"
+
+
+def chat_upload_dir(chat_id: str) -> Path:
+    """Per-chat upload folder: working_dir/uploads/{chat_id}/"""
+    d = UPLOADS_ROOT / chat_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 class FileProfile(BaseModel):
@@ -20,29 +29,43 @@ class FileProfile(BaseModel):
     preview: list[dict]
 
 
-@router.post("/{session_id}")
-async def upload(session_id: str, files: list[UploadFile] = File(...)):
+@router.post("/{chat_id}")
+async def upload(
+    chat_id: str,
+    files: list[UploadFile] = File(...),
+    user_id: str = Depends(current_user_id),
+):
+    require_chat_owner(chat_id, user_id)
+    dest = chat_upload_dir(chat_id)
     saved = []
     for f in files:
-        if not f.filename or not f.filename.lower().endswith(".csv"):
+        name = Path(f.filename or "").name  # strip any path components
+        if not name or not name.lower().endswith(".csv"):
             raise HTTPException(400, "Only .csv files allowed")
         content = await f.read()
         if len(content) > 50 * 1024 * 1024:
             raise HTTPException(413, "File too large (max 50MB)")
-        (UPLOAD_DIR / f.filename).write_bytes(content)
-        saved.append(f.filename)
+        (dest / name).write_bytes(content)
+        saved.append(name)
     return {"files": saved}
 
 
-@router.get("/{session_id}")
-def list_files(session_id: str):
-    files = [f.name for f in sorted(UPLOAD_DIR.iterdir()) if f.suffix == ".csv"]
+@router.get("/{chat_id}")
+def list_files(chat_id: str, user_id: str = Depends(current_user_id)):
+    require_chat_owner(chat_id, user_id)
+    dest = chat_upload_dir(chat_id)
+    files = [f.name for f in sorted(dest.iterdir()) if f.suffix == ".csv"]
     return {"files": files}
 
 
-@router.get("/{session_id}/profile/{filename}", response_model=FileProfile)
-def profile_file(session_id: str, filename: str):
-    path = UPLOAD_DIR / filename
+@router.get("/{chat_id}/profile/{filename}", response_model=FileProfile)
+def profile_file(
+    chat_id: str,
+    filename: str,
+    user_id: str = Depends(current_user_id),
+):
+    require_chat_owner(chat_id, user_id)
+    path = chat_upload_dir(chat_id) / Path(filename).name
     if not path.exists():
         raise HTTPException(404, "File not found")
     df = pd.read_csv(path)
@@ -76,9 +99,14 @@ def profile_file(session_id: str, filename: str):
     )
 
 
-@router.delete("/{session_id}/{filename}")
-def delete_file(session_id: str, filename: str):
-    path = UPLOAD_DIR / filename
+@router.delete("/{chat_id}/{filename}")
+def delete_file(
+    chat_id: str,
+    filename: str,
+    user_id: str = Depends(current_user_id),
+):
+    require_chat_owner(chat_id, user_id)
+    path = chat_upload_dir(chat_id) / Path(filename).name
     if path.exists():
         path.unlink()
     return {"deleted": filename}

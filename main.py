@@ -1,6 +1,7 @@
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from auth import current_user_id
 from chat import router as chat_router
 from upload import router as upload_router
 
@@ -14,8 +15,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(upload_router, prefix="/upload", tags=["upload"])
-app.include_router(chat_router, prefix="/chat", tags=["chat"])
+app.include_router(
+    upload_router,
+    prefix="/upload",
+    tags=["upload"],
+    dependencies=[Depends(current_user_id)],
+)
+app.include_router(
+    chat_router,
+    prefix="/chat",
+    tags=["chat"],
+    dependencies=[Depends(current_user_id)],
+)
 
 
 @app.get("/health")
