@@ -6,3 +6,4 @@ pandas
 openpyxl
 matplotlib
 psycopg2-binary
+boto3

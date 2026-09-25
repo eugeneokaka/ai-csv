@@ -1,13 +1,9 @@
 """Database connection for v2 — uses psycopg2 with the same Neon URL as the frontend."""
 
-import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://neondb_owner:npg_b6SUnrYcDgj7@ep-sweet-cake-b4ceoidv-pooler.c-6.us-east-2.aws.neon.tech/neondb?sslmode=require",
-)
+from config import DATABASE_URL
 
 
 def get_conn():
@@ -15,7 +11,7 @@ def get_conn():
 
 
 def init_db():
-    """Create chat and prompt tables if they don't exist."""
+    """Create chat, prompt and document tables if they don't exist."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
@@ -42,6 +38,23 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW() NOT NULL
         );
         CREATE INDEX IF NOT EXISTS prompt_chatId_idx ON prompt(chat_id);
+
+        CREATE TABLE IF NOT EXISTS document (
+            id TEXT PRIMARY KEY,
+            chat_id TEXT NOT NULL REFERENCES chat(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            s3_key TEXT,
+            source TEXT NOT NULL DEFAULT 'upload',
+            content_type TEXT,
+            size_bytes BIGINT,
+            checksum TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT NOW() NOT NULL,
+            last_accessed_at TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS document_chatId_idx ON document(chat_id);
+        CREATE INDEX IF NOT EXISTS document_chatId_filename_idx ON document(chat_id, filename);
     """)
     conn.commit()
     cur.close()
