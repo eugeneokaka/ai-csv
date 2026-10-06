@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -26,8 +27,12 @@ from fastapi import APIRouter, FastAPI
 from pydantic import BaseModel
 
 import analysis
+import cleanup
 import documents
 from config import (
+    CACHE_TTL_HOURS,
+    CLEANUP_ENABLED,
+    CLEANUP_INTERVAL_MINUTES,
     MAX_WORKERS,
     MODEL_ID,
     MODEL_PROVIDER,
@@ -56,6 +61,42 @@ OUTPUT_ROOT = WORKDIR / "output"
 pool = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="worker")
 _running = 0
 _lock = threading.Lock()
+# chat_id -> number of accepted asks (running + queued). The cleanup runner
+# reads /active so it never evicts a chat with work in flight.
+_active_chats: dict[str, int] = {}
+
+
+def _mark_active(chat_id: str) -> None:
+    with _lock:
+        _active_chats[chat_id] = _active_chats.get(chat_id, 0) + 1
+
+
+def _mark_inactive(chat_id: str) -> None:
+    with _lock:
+        remaining = _active_chats.get(chat_id, 0) - 1
+        if remaining <= 0:
+            _active_chats.pop(chat_id, None)
+        else:
+            _active_chats[chat_id] = remaining
+
+
+def _snapshot_active() -> set[str]:
+    with _lock:
+        return set(_active_chats)
+
+
+def _cleanup_loop(interval_seconds: float) -> None:
+    """Background eviction pass — runs in this worker so it sees active chats
+    directly (no HTTP /active) and owns the same `working_dir/` it protects."""
+    while True:
+        try:
+            summary = cleanup.run_once(
+                CACHE_TTL_HOURS, active_provider=_snapshot_active
+            )
+            logger.info("Cleanup pass done: %s", summary)
+        except Exception as e:  # never let a cleanup failure kill the loop
+            logger.warning("Cleanup pass failed: %s", e)
+        time.sleep(interval_seconds)
 
 
 def _uploads_dir(chat_id: str) -> Path:
@@ -335,6 +376,43 @@ def run_code(chat_id: str, code: str) -> dict:
 
 # --- DB helpers ---
 
+def get_chat_owner(chat_id: str) -> str | None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM chat WHERE id = %s", (chat_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row["user_id"] if row else None
+
+
+def persist_outputs(chat_id: str, files: list[dict]) -> None:
+    """Persist this run's new output files to S3 as `source='output'` documents.
+
+    Makes the local `working_dir/output/{chat_id}` cache disposable. Best-effort:
+    a failure logs and leaves the local file in place (never blocks the ask).
+    """
+    if not files:
+        return
+    user_id = get_chat_owner(chat_id)
+    if not user_id:
+        logger.warning("Cannot persist outputs — no chat row for %s", chat_id)
+        return
+    output_dir = _output_dir(chat_id)
+    for f in files:
+        path = output_dir / f["name"]
+        if not path.is_file():
+            continue
+        try:
+            documents.save_local_output(
+                chat_id, user_id, f["name"], path,
+                content_type=f.get("media_type"),
+            )
+            logger.info("Persisted output to S3: %s", f["name"])
+        except Exception as e:
+            logger.warning("Autosave failed for %s: %s", f["name"], e)
+
+
 def get_opencode_session(chat_id: str) -> str | None:
     conn = get_conn()
     cur = conn.cursor()
@@ -450,6 +528,7 @@ async def execute(chat_id: str, prompt_id: str, question: str,
             break
         result = run_code(chat_id, code)
 
+    persist_outputs(chat_id, result["files"])
     update_prompt(prompt_id, result["stdout"] or result["stderr"], code,
                   result["files"], result["duration_s"], attempts)
     return {"stdout": result["stdout"], "stderr": result["stderr"], "files": result["files"],
@@ -481,7 +560,30 @@ def _run_sync(req: RunRequest, submitted_at: float) -> dict:
 
 # --- HTTP API ---
 
-app = FastAPI(title="AI CSV Analyzer Worker")
+def _start_cleanup_scheduler() -> None:
+    if not CLEANUP_ENABLED or CLEANUP_INTERVAL_MINUTES <= 0:
+        logger.info("Cleanup scheduler disabled (enabled=%s, interval=%s min)",
+                    CLEANUP_ENABLED, CLEANUP_INTERVAL_MINUTES)
+        return
+    threading.Thread(
+        target=_cleanup_loop,
+        args=(CLEANUP_INTERVAL_MINUTES * 60,),
+        name="cleanup",
+        daemon=True,
+    ).start()
+    logger.info(
+        "Cleanup scheduler started | interval=%.1f min | ttl=%.1f h",
+        CLEANUP_INTERVAL_MINUTES, CACHE_TTL_HOURS,
+    )
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _start_cleanup_scheduler()
+    yield
+
+
+app = FastAPI(title="AI CSV Analyzer Worker", lifespan=lifespan)
 router = APIRouter()
 
 
@@ -500,7 +602,11 @@ async def run(req: RunRequest):
             req.chat_id, req.prompt_id, req.question[:60], running_now, MAX_WORKERS,
         )
     loop = __import__("asyncio").get_event_loop()
-    result = await loop.run_in_executor(pool, _run_sync, req, time.monotonic())
+    _mark_active(req.chat_id)
+    try:
+        result = await loop.run_in_executor(pool, _run_sync, req, time.monotonic())
+    finally:
+        _mark_inactive(req.chat_id)
     return RunResponse(**result)
 
 
@@ -511,6 +617,14 @@ def load():
         running = _running
     queued = max(0, pool._work_queue.qsize())  # noqa: SLF001 (introspection)
     return {"max_workers": MAX_WORKERS, "running": running, "queued": queued}
+
+
+@router.get("/active")
+def active():
+    """Chats with running or queued asks — the cleanup runner skips these."""
+    with _lock:
+        chats = sorted(_active_chats)
+    return {"chats": chats}
 
 
 @router.get("/health")

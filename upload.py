@@ -55,7 +55,7 @@ def _store_file(
     documents.replace_existing(chat_id, name, documents.UPLOAD)
 
     document_id = str(uuid.uuid4())
-    key = s3.document_key(chat_id, document_id, name)
+    key = s3.document_key(chat_id, documents.UPLOAD, document_id, name)
     checksum = hashlib.sha256(content).hexdigest()
 
     # Row first, key after the upload succeeds.

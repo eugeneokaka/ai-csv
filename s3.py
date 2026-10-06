@@ -36,9 +36,13 @@ def get_client():
     return _client
 
 
-def document_key(chat_id: str, document_id: str, filename: str) -> str:
-    """Canonical key layout: chats/{chat_id}/{document_id}/{filename}."""
-    return f"chats/{chat_id}/{document_id}/{filename}"
+def document_key(chat_id: str, source: str, document_id: str, filename: str) -> str:
+    """Canonical key layout: chats/{chat_id}/{source}/{document_id}/{filename}.
+
+    `source` ('upload' | 'output') is part of the key so the bucket is
+    self-describing — an output object is identifiable without the DB.
+    """
+    return f"chats/{chat_id}/{source}/{document_id}/{filename}"
 
 
 def upload_bytes(key: str, data: bytes, content_type: str | None = None) -> str:

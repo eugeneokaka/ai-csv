@@ -166,7 +166,7 @@ def save_local_output(
     """Persist an existing local output file to S3 as a `source='output'` document."""
     replace_existing(chat_id, filename, OUTPUT)
     document_id = str(uuid.uuid4())
-    key = s3.document_key(chat_id, document_id, filename)
+    key = s3.document_key(chat_id, OUTPUT, document_id, filename)
     data = local_path.read_bytes()
     checksum = hashlib.sha256(data).hexdigest()
 

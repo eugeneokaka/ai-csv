@@ -83,6 +83,7 @@ def _save_prompt(chat_id: str, question: str, selected_file: str | None = None) 
         "INSERT INTO prompt (id, chat_id, role, question) VALUES (%s, %s, 'user', %s)",
         (prompt_id, chat_id, question),
     )
+    cur.execute("UPDATE chat SET updated_at = NOW() WHERE id = %s", (chat_id,))
     conn.commit()
     cur.close()
     conn.close()

@@ -44,14 +44,27 @@ WORKER_HOST = _first("WORKER_HOST", default="127.0.0.1")
 WORKER_PORT = int(_first("WORKER_PORT", default="8001"))
 MAX_WORKERS = int(_first("MAX_WORKERS", default="2"))
 
-# --- Database ---
-DATABASE_URL = _first(
-    "DATABASE_URL",
-    default=(
-        "postgresql://neondb_owner:npg_b6SUnrYcDgj7@"
-        "ep-sweet-cake-b4ceoidv-pooler.c-6.us-east-2.aws.neon.tech/neondb?sslmode=require"
-    ),
+# --- Cache eviction ---
+# Local `working_dir/` cache is disposable; a chat idle longer than this is
+# evicted by the cleanup scheduler. S3 + Postgres stay the source of truth.
+CACHE_TTL_HOURS = float(_first("CACHE_TTL_HOURS", default="6"))
+
+# In-worker cleanup scheduler: how often the worker runs the eviction pass.
+# Set CLEANUP_ENABLED=false (or interval 0) to disable.
+CLEANUP_ENABLED = _first("CLEANUP_ENABLED", default="true").lower() in (
+    "1", "true", "yes", "on",
 )
+CLEANUP_INTERVAL_MINUTES = float(_first("CLEANUP_INTERVAL_MINUTES", default="60"))
+
+# --- Database ---
+# Credentials never live in source — set DATABASE_URL in api/.env (or the
+# process environment). Fail loudly rather than falling back to a hardcoded URL.
+DATABASE_URL = _first("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is not set. Add it to api/.env — "
+        "credentials must never be hardcoded in source."
+    )
 
 # --- AWS / S3 ---
 # Accepts both the standard names and the legacy short names.
