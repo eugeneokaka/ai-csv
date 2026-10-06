@@ -1,4 +1,7 @@
-from fastapi import Depends, FastAPI
+import socket
+from datetime import datetime, timezone
+
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from auth import current_user_id
@@ -32,6 +35,21 @@ app.include_router(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/")
+def root(request: Request):
+    """Public reachability check (no auth) — verify nginx -> API with curl."""
+    return {
+        "service": "ai-csv-api",
+        "status": "ok",
+        "host": socket.gethostname(),
+        "time": datetime.now(timezone.utc).isoformat(),
+        "client": request.client.host if request.client else None,
+        "x_forwarded_for": request.headers.get("x-forwarded-for"),
+        "x_forwarded_proto": request.headers.get("x-forwarded-proto"),
+        "host_header": request.headers.get("host"),
+    }
 
 
 if __name__ == "__main__":
