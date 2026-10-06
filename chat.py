@@ -93,7 +93,7 @@ def _get_prompts(chat_id: str) -> list[dict]:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT question, answer, files, duration_s, created_at FROM prompt WHERE chat_id = %s ORDER BY created_at",
+        "SELECT id, question, answer, files, duration_s, created_at FROM prompt WHERE chat_id = %s ORDER BY created_at",
         (chat_id,),
     )
     rows = cur.fetchall()
@@ -267,13 +267,39 @@ def history(chat_id: str, user_id: str = Depends(current_user_id)):
         if p["question"]:
             messages.append({"role": "user", "text": p["question"]})
         if p["answer"]:
+            files = p["files"] or []
             messages.append({
                 "role": "assistant",
                 "text": p["answer"],
-                "files": p["files"] or [],
+                "prompt_id": p["id"],
+                # File metadata only — the base64 payload is fetched lazily by
+                # the client via /chat/prompt/{prompt_id}/files so history stays
+                # small and renders fast.
+                "files": [
+                    {"name": f.get("name"), "media_type": f.get("media_type")}
+                    for f in files
+                ],
                 "duration_s": p["duration_s"],
             })
     return {"messages": messages}
+
+
+@router.get("/prompt/{prompt_id}/files")
+def prompt_files(prompt_id: str, chat_id: str, user_id: str = Depends(current_user_id)):
+    """Lazily fetch one answered prompt's base64 files (owner only)."""
+    require_chat_owner(chat_id, user_id)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT files FROM prompt WHERE id = %s AND chat_id = %s",
+        (prompt_id, chat_id),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if row is None:
+        raise HTTPException(404, "Prompt not found")
+    return {"files": row["files"] or []}
 
 
 @router.get("/files")

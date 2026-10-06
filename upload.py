@@ -88,8 +88,8 @@ async def upload(
     saved = []
     for f in files:
         name = Path(f.filename or "").name  # strip any path components
-        if not name or not name.lower().endswith(".csv"):
-            raise HTTPException(400, "Only .csv files allowed")
+        if not name or Path(name).suffix.lower() not in (".csv", ".xlsx"):
+            raise HTTPException(400, "Only .csv and .xlsx files allowed")
         content = await f.read()
         if len(content) > MAX_UPLOAD_BYTES:
             raise HTTPException(413, "File too large (max 50MB)")
@@ -129,7 +129,10 @@ def profile_file(
         path = documents.ensure_local(doc)
     except FileNotFoundError:
         raise HTTPException(404, "File not found")
-    df = pd.read_csv(path)
+    if path.suffix.lower() in (".xlsx", ".xls"):
+        df = pd.read_excel(path)
+    else:
+        df = pd.read_csv(path)
 
     numeric_stats = {}
     missing = {}

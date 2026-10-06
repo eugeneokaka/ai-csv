@@ -3,6 +3,8 @@
 import os
 from pathlib import Path
 
+import analysis
+
 WORKDIR = Path(__file__).resolve().parent / "working_dir"
 
 # chat.run_code() injects CHAT_ID into the subprocess env. It scopes all
@@ -26,6 +28,27 @@ def _plt():
     return plt
 
 
+# Data files the helpers can read (CSV + Excel).
+DATA_SUFFIXES = (".csv", ".xlsx")
+
+
+def _read_frame(path):
+    """Read a CSV or Excel file into a DataFrame (dispatch by suffix)."""
+    pd = _pd()
+    path = Path(path)
+    if path.suffix.lower() in (".xlsx", ".xls"):
+        return pd.read_excel(path)
+    return pd.read_csv(path)
+
+
+def _data_files(directory: Path) -> list[Path]:
+    return [
+        f
+        for f in directory.iterdir()
+        if f.is_file() and f.suffix.lower() in DATA_SUFFIXES
+    ]
+
+
 def _unique_name(directory: Path, filename: str) -> str:
     """Auto-rename if file exists: file.csv -> file_1.csv -> file_2.csv"""
     path = directory / filename
@@ -41,44 +64,41 @@ def _unique_name(directory: Path, filename: str) -> str:
 
 
 def get_preview(filename: str, rows: int = 5) -> str:
-    pd = _pd()
     # Check output first, then uploads
     path = OUTPUT / filename if (OUTPUT / filename).exists() else UPLOADS / filename
-    df = pd.read_csv(path)
+    df = _read_frame(path)
     cols = list(df.columns)
     preview = df.head(rows).to_string(index=False)
     return f"Columns: {cols}\n{rows} rows (showing first {min(rows, len(df))}):\n{preview}"
 
 
 def get_full_csv(filename: str):
-    pd = _pd()
     # Check output first, then uploads
     path = OUTPUT / filename if (OUTPUT / filename).exists() else UPLOADS / filename
-    return pd.read_csv(path)
+    return _read_frame(path)
 
 
 def get_first_csv():
-    pd = _pd()
     # Check output first (latest by modification time)
-    output_csvs = sorted(OUTPUT.glob("*.csv"), key=os.path.getmtime, reverse=True)
-    if output_csvs:
-        return pd.read_csv(output_csvs[0])
+    output_files = sorted(_data_files(OUTPUT), key=os.path.getmtime, reverse=True)
+    if output_files:
+        return _read_frame(output_files[0])
     # Fall back to uploads
-    upload_csvs = sorted(UPLOADS.glob("*.csv"))
-    if not upload_csvs:
-        raise FileNotFoundError("No CSV files uploaded yet.")
-    return pd.read_csv(upload_csvs[0])
+    upload_files = sorted(_data_files(UPLOADS))
+    if not upload_files:
+        raise FileNotFoundError("No CSV/Excel files uploaded yet.")
+    return _read_frame(upload_files[0])
 
 
 def first_csv_name() -> str:
     # Check output first
-    output_csvs = sorted(OUTPUT.glob("*.csv"), key=os.path.getmtime, reverse=True)
-    if output_csvs:
-        return output_csvs[0].name
-    upload_csvs = sorted(UPLOADS.glob("*.csv"))
-    if not upload_csvs:
-        raise FileNotFoundError("No CSV files uploaded yet.")
-    return upload_csvs[0].name
+    output_files = sorted(_data_files(OUTPUT), key=os.path.getmtime, reverse=True)
+    if output_files:
+        return output_files[0].name
+    upload_files = sorted(_data_files(UPLOADS))
+    if not upload_files:
+        raise FileNotFoundError("No CSV/Excel files uploaded yet.")
+    return upload_files[0].name
 
 
 def list_files() -> list[dict]:
@@ -126,6 +146,15 @@ def save_excel(df, filename: str = "output.xlsx", index: bool = False) -> str:
 
 
 def load_workbook(filename: str):
+    # openpyxl only opens .xlsx — catch the common mistake of passing a .csv
+    # with a clear hint so the auto-fix loop doesn't burn a retry on a cryptic
+    # openpyxl InvalidFileException.
+    if not filename.lower().endswith((".xlsx", ".xlsm", ".xltx", ".xltm")):
+        raise ValueError(
+            f"load_workbook() only opens Excel files (.xlsx). You passed "
+            f"{filename!r}. To read a CSV use helper.get_full_csv({filename!r}), "
+            f"and save Excel files with helper.save_excel(df, 'name.xlsx')."
+        )
     from openpyxl import load_workbook as _load
     # Check output first, then uploads
     path = OUTPUT / filename if (OUTPUT / filename).exists() else UPLOADS / filename
@@ -210,3 +239,50 @@ def group_aggregate(df, by: str, column: str, agg: str = "sum"):
 
 def value_counts(df, column: str, top: int = 20):
     return df[column].value_counts().head(top)
+
+
+# --- Analysis helpers (pure: DataFrame in -> factual result out) ---
+# These compute real numbers so results are never guessed. See analysis.py.
+
+def get_dataset_info(df):
+    return analysis.get_dataset_info(df)
+
+
+def get_column_info(df):
+    return analysis.get_column_info(df)
+
+
+def get_date_info(df):
+    return analysis.get_date_info(df)
+
+
+def get_missing_values(df):
+    return analysis.get_missing_values(df)
+
+
+def get_duplicate_info(df):
+    return analysis.get_duplicate_info(df)
+
+
+def get_summary_statistics(df):
+    return analysis.get_summary_statistics(df)
+
+
+def calculate_correlations(df, threshold: float = 0.5, max_pairs: int = 5):
+    return analysis.calculate_correlations(df, threshold=threshold, max_pairs=max_pairs)
+
+
+def analyze_trends(df, date_col: str | None = None):
+    return analysis.analyze_trends(df, date_col=date_col)
+
+
+def detect_time_confounding(correlations, trends, threshold: float = 0.5):
+    return analysis.detect_time_confounding(correlations, trends, threshold=threshold)
+
+
+def detect_outliers(df, k: float = 1.5):
+    return analysis.detect_outliers(df, k=k)
+
+
+def suggest_derived_metrics(df):
+    return analysis.suggest_derived_metrics(df)

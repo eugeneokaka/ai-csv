@@ -25,6 +25,7 @@ import httpx
 from fastapi import APIRouter, FastAPI
 from pydantic import BaseModel
 
+import analysis
 import documents
 from config import (
     MAX_WORKERS,
@@ -87,6 +88,7 @@ STRICT RULES:
 - To save Excel with an embedded chart: helper.save_chart_to_excel(df, "x_col", "y_col", "chart.xlsx") — use this when user asks for chart IN a sheet
 - To get full output path: helper.get_output_path("file.xlsx") or helper.get_output_dir()
 - To openpyxl style Excel: helper.save_excel(df, "out.xlsx") then wb = helper.load_workbook("out.xlsx") then style wb then wb.save(helper.get_output_path("out.xlsx"))
+- helper.load_workbook() opens ONLY .xlsx files. To read a CSV use helper.get_full_csv(name). NEVER call load_workbook on a .csv.
 - NEVER create temp files — save once, load with helper.load_workbook(), style, save again
 - NEVER use os, sys, subprocess, open() on files — use helper functions only
 - NEVER use df.to_csv(), df.to_excel(), plt.savefig(), open() for output files — use helper functions only
@@ -97,6 +99,17 @@ STRICT RULES:
 - Keep answers short and friendly — this goes to a non-technical user
 - Format numbers nicely (round, commas, %)
 - If the question is NOT about data (greeting, meta), output exactly: NO_CODE: <your answer>
+
+GROUNDING (the prompt includes an ANALYSIS FACTS block computed from the real data):
+- Treat ANALYSIS FACTS as authoritative and use it instead of estimating.
+- NEVER invent or restate a dataset size, date range, missing count, statistic, correlation, trend, or outlier count that is not in ANALYSIS FACTS or computed by your code.
+- Correlation is NOT causation — never imply a causal relationship.
+- If time-confounding is flagged for a pair, explicitly say both variables trend over time so the relationship may not be causal.
+- If ANALYSIS FACTS notes figures are sampled, do not present them as full-dataset numbers.
+- You may extend the analysis in code with: import analysis — functions include
+  get_dataset_info(df), get_column_info(df), get_date_info(df), get_missing_values(df),
+  get_duplicate_info(df), get_summary_statistics(df), calculate_correlations(df),
+  analyze_trends(df), detect_outliers(df), suggest_derived_metrics(df).
 
 You answer with ONLY the Python code — no markdown, no explanations.
 """
@@ -120,7 +133,7 @@ def hydrate_documents(chat_id: str) -> None:
 async def opencode_chat(session_id: str, prompt: str) -> str:
     logger.info("--- OPENCODE REQUEST ---")
     logger.info("Session: %s | Prompt length: %d chars", session_id, len(prompt))
-    logger.debug("Prompt:\n%s", prompt[:2000])
+    logger.debug("Prompt (first 600 chars):\n%s", prompt[:600])
     async with httpx.AsyncClient(base_url=OPENCODE_URL, timeout=180) as client:
         msg = await client.post(
             f"/session/{session_id}/message",
@@ -135,7 +148,7 @@ async def opencode_chat(session_id: str, prompt: str) -> str:
         reply = "\n".join(p.get("text", "") for p in parts if p.get("type") == "text")
         logger.info("--- OPENCODE RESPONSE ---")
         logger.info("Reply length: %d chars", len(reply))
-        logger.debug("Reply:\n%s", reply[:2000])
+        logger.debug("Reply:\n%s", reply[:1500])
         return reply
 
 
@@ -155,20 +168,32 @@ async def create_opencode_session() -> str | None:
 
 # --- Prompt building ---
 
-def get_preview(chat_id: str, filename: str) -> str:
+def _read_frame(path):
+    """Read a CSV or Excel file into a DataFrame (dispatch by suffix)."""
     import pandas as pd
+    if path.suffix.lower() in (".xlsx", ".xls"):
+        return pd.read_excel(path)
+    return pd.read_csv(path)
+
+
+def get_preview(chat_id: str, filename: str) -> str:
     out = _output_dir(chat_id) / filename
     path = out if out.exists() else _uploads_dir(chat_id) / filename
-    df = pd.read_csv(path)
+    df = _read_frame(path)
     return f"Columns: {list(df.columns)}\n5 rows:\n{df.head(5).to_string(index=False)}"
 
 
 def list_session_files(chat_id: str) -> list[str]:
     files = []
-    for f in sorted(_output_dir(chat_id).glob("*.csv"), key=os.path.getmtime, reverse=True):
-        files.append(f.name)
-    for f in sorted(_uploads_dir(chat_id).glob("*.csv")):
-        if f.name not in files:
+    for f in sorted(_output_dir(chat_id).iterdir(), key=os.path.getmtime, reverse=True):
+        if f.is_file() and f.suffix.lower() in (".csv", ".xlsx"):
+            files.append(f.name)
+    for f in sorted(_uploads_dir(chat_id).iterdir()):
+        if (
+            f.is_file()
+            and f.suffix.lower() in (".csv", ".xlsx")
+            and f.name not in files
+        ):
             files.append(f.name)
     return files
 
@@ -202,15 +227,33 @@ def build_prompt(chat_id: str, question: str, selected_file: str = None) -> str:
             f'Use helper.get_full_csv("{selected_file}") to load it.'
         )
 
+    # Ground the model with factual analysis for the primary file only (keeps the
+    # prompt bounded). Failures here must never block the ask.
+    primary = selected_file if selected_file in files else (files[0] if files else None)
+    facts_text = ""
+    if primary:
+        try:
+            path = _output_dir(chat_id) / primary
+            if not path.exists():
+                path = _uploads_dir(chat_id) / primary
+            df = _read_frame(path)
+            facts_text = (
+                f"--- ANALYSIS FACTS (authoritative, computed from {primary}) ---\n"
+                f"{analysis.build_facts_text(df)}\n\n"
+            )
+        except Exception as e:
+            logger.warning("Analysis facts failed for %s: %s", primary, e)
+
     logger.info("=== PROMPT ===")
     logger.info("Chat: %s", chat_id)
     logger.info("Question: %s", question)
     logger.info("Available files: %s", files)
     logger.info("Selected file: %s", selected_file)
-    logger.info("Data preview:\n%s", data_desc)
+    logger.debug("Data preview:\n%s", data_desc)
 
     return (
         f"{SYSTEM_PROMPT}\n\nAvailable files:\n{file_list}\n\n"
+        f"{facts_text}"
         f"Data preview:\n{data_desc}{selected_hint}\n\nQuestion: {question}"
     )
 
@@ -414,11 +457,20 @@ async def execute(chat_id: str, prompt_id: str, question: str,
             "opencode_session_id": oc_session}
 
 
-def _run_sync(req: RunRequest) -> dict:
-    """Called inside the pool thread — owns the running counter."""
+def _run_sync(req: RunRequest, submitted_at: float) -> dict:
+    """Called inside the pool thread — owns the running counter.
+
+    The gap between submit and this call starting is the queue wait.
+    """
     global _running
+    wait = time.monotonic() - submitted_at
     with _lock:
         _running += 1
+        running_now = _running
+    logger.info(
+        "START | chat=%s prompt=%s | waited %.1fs for a slot | running=%d/%d",
+        req.chat_id, req.prompt_id, wait, running_now, MAX_WORKERS,
+    )
     try:
         import asyncio
         return asyncio.run(execute(req.chat_id, req.prompt_id, req.question, req.selected_file))
@@ -435,9 +487,20 @@ router = APIRouter()
 
 @router.post("/run", response_model=RunResponse)
 async def run(req: RunRequest):
-    logger.info("RUN | chat=%s prompt=%s q=%r", req.chat_id, req.prompt_id, req.question[:60])
+    with _lock:
+        running_now = _running
+    if running_now >= MAX_WORKERS:
+        logger.info(
+            "QUEUE | chat=%s prompt=%s q=%r | all %d slots busy — waiting",
+            req.chat_id, req.prompt_id, req.question[:60], MAX_WORKERS,
+        )
+    else:
+        logger.info(
+            "RUN | chat=%s prompt=%s q=%r | slot free (%d/%d)",
+            req.chat_id, req.prompt_id, req.question[:60], running_now, MAX_WORKERS,
+        )
     loop = __import__("asyncio").get_event_loop()
-    result = await loop.run_in_executor(pool, _run_sync, req)
+    result = await loop.run_in_executor(pool, _run_sync, req, time.monotonic())
     return RunResponse(**result)
 
 
